@@ -42,7 +42,21 @@ void Logo_Term(void) {
  * Shows one full-screen picture: optional fade out of what is on screen first, fade in (from black or white),
  * `frames` + 2 frames, fade out (to black or white). The background partition load is polled every frame.
  */
+#ifdef PORT
+/* The port: one press skips all the boot pictures that are left (the last one too), and the page's touch on the
+   picture counts as that press while they show (port/web/net.js: gPortInLogos). */
+s32 gPortInLogos;
+static s32 sLogoSkipAll;
+#endif
+
 void Logo_Show(u32 *pack, s32 section, s32 frames, s32 fade, s32 skip, s32 inBlack, s32 outBlack, s32 fadeFirst) {
+#ifdef PORT
+    if (sLogoSkipAll) {
+        return;
+    }
+    gPortInLogos = 1;
+    skip = LOGO_SKIP_ANY;
+#endif
     Logo_Init(pack, section, frames);
     if (fadeFirst) {
         LOGO_FADE_OUT(inBlack, fade);
@@ -92,7 +106,12 @@ void Logo_Show(u32 *pack, s32 section, s32 frames, s32 fade, s32 skip, s32 inBla
         switch (skip) {
         case LOGO_SKIP_ANY:
             if (gPad[0].gamePressed & (PADG_START | PADG_CROSS)) {
+#ifdef PORT
+                sLogoSkipAll = 1;
+                LOGO_FADE_OUT(1, fade / 4);
+#else
                 LOGO_FADE_OUT(outBlack, fade / 2);
+#endif
             }
             break;
         case LOGO_SKIP_AFTER_60:
@@ -107,6 +126,9 @@ void Logo_Show(u32 *pack, s32 section, s32 frames, s32 fade, s32 skip, s32 inBla
     sceGsSyncPath(0, 0);
     Logo_Term();
     Dma_ResetBuffers();
+#ifdef PORT
+    gPortInLogos = 0;
+#endif
 }
 
 /* The six boot pictures in order: sections 6, 7, 8, 3, 4, 5 of the unpacked pack, 120 frames each. */

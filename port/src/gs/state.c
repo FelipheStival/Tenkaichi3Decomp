@@ -74,10 +74,12 @@ static void regions_init(void) {
     sRegion[sRegions].n = heapSize;
     sRegion[sRegions].what = "heap";
     sRegions++;
+#ifndef __EMSCRIPTEN__ /* the browser build has no scratchpad (plat_mem.c) */
     sRegion[sRegions].p = (const uint8_t *)(uintptr_t)0x70000000u;
     sRegion[sRegions].n = 0x4000;
     sRegion[sRegions].what = "scratchpad";
     sRegions++;
+#endif
 }
 
 uint64_t Port_StateHash(void) {

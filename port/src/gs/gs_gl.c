@@ -70,6 +70,7 @@ typedef void GLvoid; typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; t
     X(glGetUniformBlockIndex, GLuint, (GLuint, const GLchar *), (GLuint, const GLchar *)) \
     X(glUniformBlockBinding, void, (GLuint, GLuint, GLuint), (GLuint, GLuint, GLuint)) \
     X(glBindBufferBase, void, (GLenum, GLuint, GLuint), (GLenum, GLuint, GLuint)) \
+    X(glBindBufferRange, void, (GLenum, GLuint, GLuint, GLintptr, GLsizeiptr), (GLenum, GLuint, GLuint, GLintptr, GLsizeiptr)) \
     X(glGenBuffers, void, (GLsizei, GLuint *), (GLsizei, GLuint *)) \
     X(glBindBuffer, void, (GLenum, GLuint), (GLenum, GLuint)) \
     X(glBufferData, void, (GLenum, GLsizeiptr, const void *, GLenum), (GLenum, GLsizeiptr, const void *, GLenum)) \
@@ -193,10 +194,15 @@ GL_FUNCS(GL_DECL)
 static void (*glClipControl)(GLenum, GLenum); /* optional: GL 4.5 / ARB_clip_control */
 static int sHasClipControl;
 
+/* Entry points the renderer works without (WebGL 2 has no per-attachment blend and mask: sHasIndexed). */
+static int gl_optional(const char *name) {
+    return !strcmp(name, "glEnablei") || !strcmp(name, "glDisablei") || !strcmp(name, "glColorMaski");
+}
+
 static int load_gl(void) {
 #define LOAD(name, ret, args, callargs) \
     name = (ret (*) args)SDL_GL_GetProcAddress(#name); \
-    if (!name) { fprintf(stderr, "bt3: gl: missing GL entry point %s\n", #name); return 0; }
+    if (!name && !gl_optional(#name)) { fprintf(stderr, "bt3: gl: missing GL entry point %s\n", #name); return 0; }
     GL_FUNCS(LOAD)
 #undef LOAD
     return 1;
@@ -214,6 +220,13 @@ static char *translate(const char *src, int is_vertex) {
 #define PUSH(str) PUSHN((str), strlen(str))
     const char *p = src;
     while (*p) {
+#ifdef __EMSCRIPTEN__ /* WebGL 2: GLSL ES 3.00, which needs its precisions said */
+        if (!strncmp(p, "#version 450", 12)) {
+            PUSH("#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;");
+            p += 12;
+            continue;
+        }
+#endif
         if (!strncmp(p, "#version 450", 12)) { PUSH("#version 330 core"); p += 12; continue; }
         if (!strncmp(p, "gl_VertexIndex", 14)) { PUSH("gl_VertexID"); p += 14; continue; }
         if (!strncmp(p, "layout(set", 10)) {
@@ -315,13 +328,22 @@ static GLuint make_program(const unsigned char *vsrc, const unsigned char *fsrc,
 /* The present: one textured full-screen triangle sampling the shown buffer's colour, drawn with the viewport
    set to the letterboxed rectangle. (A textured quad, as the OpenGL framebuffer guide does it, instead of a
    scaled/flipped blit.) */
+#ifdef __EMSCRIPTEN__
+#define PRESENT_VERSION "#version 300 es\nprecision highp float;\n"
+#else
+#define PRESENT_VERSION "#version 330 core\n"
+#endif
 static GLuint make_present_program(void) {
-    static const char *vs = "#version 330 core\nout vec2 vUv;\nvoid main() {\n"
+    static const char *vs = PRESENT_VERSION "out vec2 vUv;\nvoid main() {\n"
         "    vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);\n"
         "    vUv = vec2((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);\n"  /* y flipped: the scene's top row to the window's top */
         "    gl_Position = vec4(p, 0.0, 1.0);\n}\n";
-    static const char *fs = "#version 330 core\nin vec2 vUv;\nout vec4 o;\nuniform sampler2D tex;\nuniform vec2 uvScale;\n"
+    static const char *fs = PRESENT_VERSION "in vec2 vUv;\nout vec4 o;\nuniform sampler2D tex;\nuniform vec2 uvScale;\n"
+#ifdef __EMSCRIPTEN__ /* opaque on the page, whatever the canvas was given (see SDL_GL_ALPHA_SIZE above) */
+        "void main() { o = vec4(texture(tex, vUv * uvScale).rgb, 1.0); }\n";
+#else
         "void main() { o = texture(tex, vUv * uvScale); }\n";
+#endif
     GLuint v = compile(GL_VERTEX_SHADER, vs, "present.vs"), f = compile(GL_FRAGMENT_SHADER, fs, "present.fs"), p;
     GLint ok = 0;
     p = glCreateProgram();
@@ -487,28 +509,69 @@ static int haveScissor = 0;
 static int lastScissor[4];
 static float lastBlendc = -1.0f;
 
+/* What the draw loop last set (frame_end): a pipeline change sends only the state that differs. Every draw costs a
+   call into the browser per GL function in WebGL, and a fight's 2400 draws switch pipeline at nearly every one.
+   sGlc.valid = 0 forgets it all (at the loop's start; nothing else touches this state inside the loop). */
+static struct { int valid, blend, depthTest, depthMask, active; GLenum bf0, bf1, be, depthFunc; uint32_t mask; GLuint vao; } sGlc;
+static void c_blend(int on) {
+    if (sGlc.valid && sGlc.blend == on) { return; }
+    sGlc.blend = on;
+    if (sHasIndexed) {
+        if (on) { glEnablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); } else { glDisablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); }
+    } else if (on) {
+        glEnable(GL_BLEND);
+    } else {
+        glDisable(GL_BLEND);
+    }
+}
+static void c_blendfunc(GLenum f0, GLenum f1, GLenum eq) {
+    if (!sGlc.valid || sGlc.bf0 != f0 || sGlc.bf1 != f1) { glBlendFuncSeparate(f0, f1, GL_ONE, GL_ZERO); sGlc.bf0 = f0; sGlc.bf1 = f1; }
+    if (!sGlc.valid || sGlc.be != eq) { glBlendEquationSeparate(eq, GL_FUNC_ADD); sGlc.be = eq; }
+}
+static void c_depth(int test, int mask, GLenum func) {
+    if (!sGlc.valid || sGlc.depthTest != test) { if (test) { glEnable(GL_DEPTH_TEST); } else { glDisable(GL_DEPTH_TEST); } sGlc.depthTest = test; }
+    if (!sGlc.valid || sGlc.depthMask != mask) { glDepthMask(mask ? GL_TRUE : GL_FALSE); sGlc.depthMask = mask; }
+    if (test && (!sGlc.valid || sGlc.depthFunc != func)) { glDepthFunc(func); sGlc.depthFunc = func; }
+}
+static void c_active(int unit) {
+    if (!sGlc.valid || sGlc.active != unit) { glActiveTexture(GL_TEXTURE0 + (GLenum)unit); sGlc.active = unit; }
+}
+static void c_vao(GLuint vao) {
+    if (!sGlc.valid || sGlc.vao != vao) { glBindVertexArray(vao); sGlc.vao = vao; }
+}
+/* the loop's start: what is bound now is unknown; afterwards everything is sent once and then only on changes */
+static void c_reset(void) {
+    sGlc.valid = 0;
+}
+static void c_validate(void) {
+    if (sGlc.valid) { return; }
+    /* force every cached value to be sent once: set them to values no call uses */
+    sGlc.blend = sGlc.depthTest = sGlc.depthMask = sGlc.active = -1;
+    sGlc.bf0 = sGlc.bf1 = sGlc.be = sGlc.depthFunc = 0xFFFFFFFFu;
+    sGlc.mask = 0xFFFFFFFFu;
+    sGlc.vao = 0xFFFFFFFFu;
+    sGlc.valid = 1;
+}
+
 static void apply_blend(uint32_t bkey) {
     int k[2] = {(int)((bkey >> 1) & 7), (int)((bkey >> 4) & 7)}, C = (int)((bkey >> 7) & 3), i;
     GLenum fc = C == 0 ? GL_SRC_ALPHA : C == 1 ? GL_DST_ALPHA : GL_CONSTANT_COLOR;
     GLenum fi = C == 0 ? GL_ONE_MINUS_SRC_ALPHA : C == 1 ? GL_ONE_MINUS_DST_ALPHA : GL_ONE_MINUS_CONSTANT_COLOR;
     GLenum f[2];
     int enabled = (bkey & 1) != 0;
-    if (sHasIndexed) {
-        if (enabled) { glEnablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); } else { glDisablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); }
-    } else if (enabled) {
-        glEnable(GL_BLEND);
-    } else {
-        glDisable(GL_BLEND);
-    }
+    c_validate();
+    c_blend(enabled);
     if (!enabled) { return; }
     for (i = 0; i < 2; i++) {
         f[i] = k[i] == 0 ? GL_ZERO : k[i] == 1 || k[i] == 5 ? GL_ONE : k[i] == 4 ? fi : fc;
     }
-    glBlendFuncSeparate(f[0], f[1], GL_ONE, GL_ZERO);
-    glBlendEquationSeparate(k[0] == 3 ? GL_FUNC_REVERSE_SUBTRACT : k[1] == 3 ? GL_FUNC_SUBTRACT : GL_FUNC_ADD, GL_FUNC_ADD);
+    c_blendfunc(f[0], f[1], k[0] == 3 ? GL_FUNC_REVERSE_SUBTRACT : k[1] == 3 ? GL_FUNC_SUBTRACT : GL_FUNC_ADD);
 }
 
 static void apply_masks(uint32_t wmask) {
+    c_validate();
+    if (sGlc.mask == wmask) { return; }
+    sGlc.mask = wmask;
     if (sHasIndexed) {
         glColorMaski(0, (wmask & GS_CC_R) != 0, (wmask & GS_CC_G) != 0, (wmask & GS_CC_B) != 0, (wmask & GS_CC_A) != 0);
         glColorMaski(1, (wmask & GS_CC_A) != 0, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -517,14 +580,128 @@ static void apply_masks(uint32_t wmask) {
     }
 }
 
+#define BUFFER_UPDATE(target, n, p, size) glBufferSubData((target), 0, (GLsizeiptr)(n), (p))
+
+/* The browser (WebGL): the frame's uniform blocks are written once, before its draws, into two large buffers, and
+   each draw binds its own part (glBindBufferRange). Rewriting one small block before every draw, as below, is cheap
+   in a desktop driver but not in WebGL on Metal (Safari, every iPhone browser): a buffer the frame's draws are
+   still to read cannot be changed in the middle of the frame without splitting it into a separate render pass per
+   draw, and a fight has some 2400 draws. */
+#ifdef __EMSCRIPTEN__
+#define UBO_RANGES 1
+#else
+#define UBO_RANGES 0
+#endif
+#ifndef GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT
+#define GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT 0x8A34
+#endif
+static GLuint sUboArenaP, sUboArenaU;
+static uint8_t *sArena;
+static size_t sArenaCap, *sParamOff, sParamOffCap, sStrideP, sStrideU, sBoundP = (size_t)-1, sBoundU = (size_t)-1;
+static int sDrawIdx = -1;
+
+static void *grow(void *p, size_t *cap, size_t need, size_t unit) {
+    if (need > *cap) {
+        *cap = need + need / 2;
+        p = realloc(p, *cap * unit);
+    }
+    return p;
+}
+
+/* the Params block draw d binds (64 bytes; 0 when it binds none), as the draw loop of frame_end sets it */
+static int draw_params(const GsDraw *d, float out[16]) {
+    memset(out, 0, 64);
+    if (d->native >= 100 || d->native == 5 || d->native == 4) {
+        return 0;
+    }
+    if (d->native == 3) {
+        out[0] = (float)d->src;
+        out[1] = d->misc[0];
+    } else if (d->native) {
+        out[0] = 1.0f / (float)GS_W;
+        out[1] = 1.0f / (float)GS_H;
+        out[2] = 100.0f / 255.0f;
+        out[3] = getenv("BT3_FX_DEBUG") != NULL ? 1.0f : 0.0f;
+    } else {
+        memcpy(&out[0], d->mode, 16);
+        memcpy(&out[4], d->misc, 16);
+        memcpy(&out[8], d->rect, 16);
+        memcpy(&out[12], d->orig, 16);
+    }
+    return 1;
+}
+
+static void ranges_prepare(void) {
+    GLint align = 256;
+    size_t used = 0, last = (size_t)-1, need, n;
+    float p[16], lastp[16];
+    if (sUboArenaP == 0) {
+        glGenBuffers(1, &sUboArenaP);
+        glGenBuffers(1, &sUboArenaU);
+        glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &align);
+        if (align < 16) { align = 16; }
+        sStrideP = (64 + (size_t)align - 1) / (size_t)align * (size_t)align;
+        sStrideU = (sizeof(Vu0Uniform) + (size_t)align - 1) / (size_t)align * (size_t)align;
+    }
+    sParamOff = grow(sParamOff, &sParamOffCap, gsDrawCount + 1, sizeof(size_t));
+    need = (gsDrawCount + 1) * sStrideP;
+    if (gsVuUniCount * sStrideU > need) { need = gsVuUniCount * sStrideU; }
+    sArena = grow(sArena, &sArenaCap, need, 1);
+    for (n = 0; n < gsDrawCount; n++) {
+        if (!draw_params(&gsDraws[n], p)) {
+            sParamOff[n] = 0;
+            continue;
+        }
+        if (last == (size_t)-1 || memcmp(p, lastp, 64) != 0) {
+            memcpy(sArena + used, p, 64);
+            memcpy(lastp, p, 64);
+            last = used;
+            used += sStrideP;
+        }
+        sParamOff[n] = last;
+    }
+    glBindBuffer(GL_UNIFORM_BUFFER, sUboArenaP);
+    glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)(used != 0 ? used : sStrideP), used != 0 ? sArena : NULL, GL_STREAM_DRAW);
+    if (gsVuUniCount != 0) {
+        for (n = 0; n < gsVuUniCount; n++) {
+            memcpy(sArena + n * sStrideU, &gsVuUni[n], sizeof(Vu0Uniform));
+        }
+        glBindBuffer(GL_UNIFORM_BUFFER, sUboArenaU);
+        glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)(gsVuUniCount * sStrideU), sArena, GL_STREAM_DRAW);
+    }
+    sBoundP = sBoundU = (size_t)-1;
+}
+
+static void ranges_done(void) {
+    sDrawIdx = -1;
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, sUboU);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 1, sUboParams);
+}
+
 static void set_params(const void *p, size_t n) {
+    if (UBO_RANGES && sDrawIdx >= 0) {
+        size_t off = sParamOff[sDrawIdx];
+        if (off != sBoundP) {
+            glBindBufferRange(GL_UNIFORM_BUFFER, 1, sUboArenaP, (GLintptr)off, 64);
+            sBoundP = off;
+        }
+        return;
+    }
     glBindBuffer(GL_UNIFORM_BUFFER, sUboParams);
-    glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)n, p);
+    BUFFER_UPDATE(GL_UNIFORM_BUFFER, n, p, 64);
 }
 
 static void set_uniform_u(const Vu0Uniform *u) {
+    if (UBO_RANGES && sDrawIdx >= 0) {
+        size_t off = (size_t)(u - gsVuUni) * sStrideU;
+        if (off != sBoundU) {
+            glBindBufferRange(GL_UNIFORM_BUFFER, 0, sUboArenaU, (GLintptr)off, sizeof(Vu0Uniform));
+            sBoundU = off;
+        }
+        return;
+    }
     glBindBuffer(GL_UNIFORM_BUFFER, sUboU);
-    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(Vu0Uniform), u);
+    BUFFER_UPDATE(GL_UNIFORM_BUFFER, sizeof(Vu0Uniform), u, sizeof(Vu0Uniform));
 }
 
 static void set_pipe(int pipe) {
@@ -539,27 +716,23 @@ static void set_pipe(int pipe) {
     apply_blend(p->bkey);
     apply_masks(p->wmask);
     if (p->fx) {
-        glDisable(GL_DEPTH_TEST);
-        glDepthMask(GL_FALSE);
+        c_depth(0, 0, 0);
     } else {
-        glEnable(GL_DEPTH_TEST);
-        glDepthMask(p->zwrite ? GL_TRUE : GL_FALSE);
-        glDepthFunc(p->ztst == 0 ? GL_NEVER : p->ztst == 1 ? GL_ALWAYS : p->ztst == 2 ? GL_GEQUAL : GL_GREATER);
+        c_depth(1, p->zwrite, p->ztst == 0 ? GL_NEVER : p->ztst == 1 ? GL_ALWAYS : p->ztst == 2 ? GL_GEQUAL : GL_GREATER);
     }
 }
 
 static void set_native(int effect) {
     sCurPipe = -1;
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    if (sHasIndexed) { glEnablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); } else { glEnable(GL_BLEND); }
+    c_validate();
+    c_depth(0, 0, 0);
+    c_blend(1);
     if (effect == 2) {
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
-        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        c_blendfunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_FUNC_ADD);
     } else {
-        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ZERO);
-        glBlendEquationSeparate(GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
+        c_blendfunc(GL_ONE, GL_ONE, GL_FUNC_REVERSE_SUBTRACT);
     }
+    sGlc.mask = 0xFFFFFFFEu; /* (a mask no pipeline has: the next pipeline sends its own) */
     if (sHasIndexed) {
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
         glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -581,22 +754,27 @@ static void set_scissor(const int *sc) {
 }
 
 static void set_textures(GLuint t0, int s0, GLuint t1, int s1, GLuint t2, int s2) {
-    if (sCurTex0 != t0 || sCurSamp0 != s0) {
-        glActiveTexture(GL_TEXTURE0);
+    c_validate();
+    if (sCurTex0 != t0) {
+        c_active(0);
         glBindTexture(GL_TEXTURE_2D, t0);
-        glBindSampler(0, sSamplers[s0]);
         sCurTex0 = t0;
+    }
+    if (sCurSamp0 != s0) {
+        glBindSampler(0, sSamplers[s0]);
         sCurSamp0 = s0;
     }
-    if (sCurTex1 != t1 || sCurSamp1 != s1) {
-        glActiveTexture(GL_TEXTURE0 + 1);
+    if (sCurTex1 != t1) {
+        c_active(1);
         glBindTexture(GL_TEXTURE_2D, t1);
-        glBindSampler(1, sSamplers[s1]);
         sCurTex1 = t1;
+    }
+    if (sCurSamp1 != s1) {
+        glBindSampler(1, sSamplers[s1]);
         sCurSamp1 = s1;
     }
     if (t2 != 0 && sCurTex2 != t2) {
-        glActiveTexture(GL_TEXTURE0 + 2);
+        c_active(2);
         glBindTexture(GL_TEXTURE_2D, t2);
         glBindSampler(2, sSamplers[6]);
         sCurTex2 = t2;
@@ -618,12 +796,67 @@ static void bind_target(int i, int clear) {
         else { glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); }
         glDepthMask(GL_TRUE);
         sCurPipe = -1;
+        sGlc.mask = 0xFFFFFFFDu; /* (the state cache: the masks are open now) */
+        sGlc.depthMask = 1;
         glClearBufferfv(GL_COLOR, 0, col);
         glClearBufferfv(GL_COLOR, 1, aux);
         glClearBufferfv(GL_DEPTH, 0, &dep);
         glEnable(GL_SCISSOR_TEST);
     }
 }
+
+#ifdef __EMSCRIPTEN__
+/* WebGL 2 refuses a draw that samples a texture attached to the frame buffer it draws into (a "feedback loop";
+   desktop GL lets it through). The game does that on purpose (parts of a frame buffer drawn back onto it), so
+   such a texture is copied first and the copy is sampled: what the draw reads is the target as it was before
+   the draw, which is what the PS2 reads too for every pixel not written by the same primitive. */
+static GLuint sFbCopyTex[3], sFbCopyFbo[3];
+
+static GLuint feedback_safe(GLuint tex, int target) {
+    static const GLenum fmt[3][3] = {{GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE}, {GL_R8, GL_RED, GL_UNSIGNED_BYTE},
+                                     {GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT}};
+    GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1}, one[1] = {GL_COLOR_ATTACHMENT0};
+    int k = tex == sTgCol[target] ? 0 : tex == sTgAux[target] ? 1 : tex == sTgDep[target] ? 2 : -1;
+
+    if (k < 0 || tex == 0) {
+        return tex;
+    }
+    if (sFbCopyTex[k] == 0) {
+        glGenTextures(1, &sFbCopyTex[k]);
+        glBindTexture(GL_TEXTURE_2D, sFbCopyTex[k]);
+        glTexImage2D(GL_TEXTURE_2D, 0, (GLint)fmt[k][0], GS_W * SCALE, GS_H * SCALE, 0, fmt[k][1], fmt[k][2], NULL);
+        glGenFramebuffers(1, &sFbCopyFbo[k]);
+        glBindFramebuffer(GL_FRAMEBUFFER, sFbCopyFbo[k]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, k == 2 ? GL_DEPTH_ATTACHMENT : GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sFbCopyTex[k], 0);
+        sCurTex0 = sCurTex1 = sCurTex2 = 0; /* the binding of unit 0 changed */
+    }
+    glDisable(GL_SCISSOR_TEST); /* a blit obeys the scissor test: the copy must be whole */
+    if (k == 1) { /* the aux texture is attachment 1: read it through the scratch read buffer */
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, sScratchRead);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[target]);
+    }
+    glReadBuffer(k == 2 ? 0 /* GL_NONE */ : GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sFbCopyFbo[k]);
+    if (k != 2) { glDrawBuffers(1, one); }
+    glBlitFramebuffer(0, 0, GS_W * SCALE, GS_H * SCALE, 0, 0, GS_W * SCALE, GS_H * SCALE,
+                      k == 2 ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    if (k == 1) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, sScratchRead);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[target]);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_FRAMEBUFFER, sTgFbo[target]);
+    glDrawBuffers(2, bufs);
+    glEnable(GL_SCISSOR_TEST);
+    return sFbCopyTex[k];
+}
+#define FEEDBACK_SAFE(tex, target) feedback_safe((tex), (target))
+#else
+#define FEEDBACK_SAFE(tex, target) (tex)
+#endif
 
 /* ---- init --------------------------------------------------------------------------------------- */
 static int gl_init(void) {
@@ -633,9 +866,18 @@ static int gl_init(void) {
     sWindow = GsDraw_WindowCreate(1);
     if (sWindow == NULL) { return 0; }
     if (getenv("BT3_GL_TRACE") != NULL) { fprintf(stderr, "gl: the window is there\n"); }
+#ifdef __EMSCRIPTEN__ /* WebGL 2 is OpenGL ES 3.0 */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    /* No alpha in the canvas: the page would treat the frame buffer's alpha byte (the game's own data, which a
+       screen ignores) as transparency and show the page through every pixel the game left at alpha 0. */
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
     if (getenv("BT3_GPU_DEBUG") != NULL) { SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG); }
     if (getenv("BT3_GL_TRACE") != NULL) { fprintf(stderr, "gl: window made, creating the context\n"); }
     sCtx = SDL_GL_CreateContext(sWindow);
@@ -647,16 +889,41 @@ static int gl_init(void) {
     SDL_GL_SetSwapInterval(0);
     if (getenv("BT3_GL_TRACE") != NULL) { fprintf(stderr, "gl: current, loading the functions\n"); }
     if (!load_gl()) { return 0; }
+#ifdef __EMSCRIPTEN__ /* WebGL 2: the indexed blend switch and mask from OES_draw_buffers_indexed (port/web/target/gl_web.c) */
+    {
+        extern int Web_GlIndexedInit(void);
+        extern void Web_glEnablei(GLenum, GLuint), Web_glDisablei(GLenum, GLuint);
+        extern void Web_glColorMaski(GLuint, GLboolean, GLboolean, GLboolean, GLboolean);
+        if (Web_GlIndexedInit()) {
+            glEnablei = Web_glEnablei;
+            glDisablei = Web_glDisablei;
+            glColorMaski = Web_glColorMaski;
+        }
+    }
+#endif
     fprintf(stderr, "bt3: GL renderer: %s (%s)\n", (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
     sHasIndexed = glEnablei != NULL && glColorMaski != NULL;
     /* Depth as the Vulkan back end has it: clip-space z in 0..w stored as z / w, and (SDL GPU's default, depth
        clip off) nothing cut at the near and far planes, the depth clamped to 0..1 instead. */
+#ifdef __EMSCRIPTEN__ /* WebGL 2: EXT_clip_control and EXT_depth_clamp (port/web/target/gl_web.c) */
+    {
+        extern int Web_GlClipControlInit(void), Web_GlDepthClamp(void);
+        extern void Web_glClipControl(GLenum, GLenum);
+        if (getenv("BT3_GL_NOCLIPCONTROL") == NULL && Web_GlClipControlInit()) {
+            glClipControl = Web_glClipControl;
+        }
+        sHasClipControl = glClipControl != NULL;
+        if (sHasClipControl) { glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE); }
+        if (!Web_GlDepthClamp()) { fprintf(stderr, "bt3: gl: no depth clamp (EXT_depth_clamp): sprites outside the depth range are cut\n"); }
+    }
+#else
     if (getenv("BT3_GL_NOCLIPCONTROL") == NULL && SDL_GL_ExtensionSupported("GL_ARB_clip_control")) {
         glClipControl = (void (*)(GLenum, GLenum))SDL_GL_GetProcAddress("glClipControl");
     }
     sHasClipControl = glClipControl != NULL;
     if (sHasClipControl) { glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE); }
     glEnable(GL_DEPTH_CLAMP);
+#endif
     if (!sHasIndexed) { fprintf(stderr, "bt3: gl: no per-attachment blend/mask (GL 3.0 indexed): the aux byte may be wrong\n"); }
 
     sMainProg[0] = make_program(kGsVertGlsl, kGsFragGlsl, "gs", sGsSamplers, 2);
@@ -752,7 +1019,24 @@ void GsGl_StripTextureFree(unsigned id) {
 }
 
 /* ---- the frame ---------------------------------------------------------------------------------- */
+static void frame_end_body(void);
+#ifdef __EMSCRIPTEN__
+static double sTBody;
+#endif
 static void frame_end(void) {
+#ifdef __EMSCRIPTEN__ /* the browser build's statistics (port/web/target/yield_web.c: Module.webStats.prof[0]) */
+    extern double emscripten_get_now(void);
+    extern void Web_ProfAdd(int slot, double ms);
+    double t = emscripten_get_now();
+    sTBody = t;
+    frame_end_body();
+    Web_ProfAdd(0, emscripten_get_now() - t);
+#else
+    frame_end_body();
+#endif
+}
+
+static void frame_end_body(void) {
     SDL_Event ev;
     int cur = -1, best = -1, i;
     uint32_t n;
@@ -763,7 +1047,9 @@ static void frame_end(void) {
         if (ev.type == SDL_EVENT_QUIT) { exit(0); }
         if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F1) { Ui_Toggle(); continue; }
         if (Ui_Event(&ev)) { continue; }
+#ifndef __EMSCRIPTEN__ /* (the browser: a page is closed with its tab, not a key) */
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) { exit(0); }
+#endif
         if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9) { /* in-between pictures on / off */
             extern int gsInterp;
             extern void Port_SettingSave(const char *name, int value);
@@ -796,15 +1082,15 @@ static void frame_end(void) {
 
     if (gsVertCount != 0) {
         glBindBuffer(GL_ARRAY_BUFFER, sVboGs);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(gsVertCount * sizeof(Vtx)), gsVerts);
+        BUFFER_UPDATE(GL_ARRAY_BUFFER, gsVertCount * sizeof(Vtx), gsVerts, gsVertCount * sizeof(Vtx));
     }
     if (gsVuVertCount != 0) {
         glBindBuffer(GL_ARRAY_BUFFER, sVboVu);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(gsVuVertCount * 48), gsVuVerts);
+        BUFFER_UPDATE(GL_ARRAY_BUFFER, gsVuVertCount * 48, gsVuVerts, gsVuVertCount * 48);
     }
     if (gsVuIdxCount != 0) {
         glBindVertexArray(sVaoVu);
-        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (GLsizeiptr)(gsVuIdxCount * sizeof(uint32_t)), gsVuIdx);
+        BUFFER_UPDATE(GL_ELEMENT_ARRAY_BUFFER, gsVuIdxCount * sizeof(uint32_t), gsVuIdx, gsVuIdxCount * sizeof(uint32_t));
         glBindVertexArray(0);
     }
     for (i = 0; i < 2; i++) {
@@ -835,14 +1121,23 @@ static void frame_end(void) {
     sCurProgram = 0;
     sCurTex0 = sCurTex1 = sCurTex2 = 0;
     sCurSamp0 = sCurSamp1 = -1;
+    c_reset();
     haveScissor = 0;
     lastBlendc = -1.0f;
     /* The present draws its full-screen triangle with the scissor test off (see the end of this function); turn it
        back on for the frame's own draws, or every partial scissor (the split screen's halves, the HUD, the
        fighters' shadows) is ignored and the two views overlap across the whole screen. */
     glEnable(GL_SCISSOR_TEST);
+#ifdef __EMSCRIPTEN__
+    extern double emscripten_get_now(void);
+    extern void Web_ProfAdd(int slot, double ms);
+    double tLoop = emscripten_get_now();
+    Web_ProfAdd(2, tLoop - sTBody); /* before the draws: events, frame-buffer uploads (prof[2]) */
+#endif
+    if (UBO_RANGES) { ranges_prepare(); }
     for (n = 0; n < gsDrawCount; n++) {
         const GsDraw *d = &gsDraws[n];
+        sDrawIdx = UBO_RANGES ? (int)n : -1;
         if (d->native >= 100) {
             GLenum one[1] = {GL_COLOR_ATTACHMENT0};
             if (sFbTex[d->native - 100] == 0) { continue; }
@@ -885,7 +1180,7 @@ static void frame_end(void) {
             if (!gsTargets[d->target].cleared) { continue; }
             if (cur != d->target) { bind_target(d->target, 0); cur = d->target; }
             set_pipe(d->pipeline);
-            set_textures(sTgDep[d->target], 6, sAuxCopy, 6, (GLuint)d->tex, 6);
+            set_textures(FEEDBACK_SAFE(sTgDep[d->target], d->target), 6, sAuxCopy, 6, FEEDBACK_SAFE((GLuint)d->tex, d->target), 6);
             set_params(params, 16);
             haveFu = 0; /* the Params block now holds this pass's: the next primitive sends its own again */
             if (d->blendc != lastBlendc) { glBlendColor(d->blendc, d->blendc, d->blendc, d->blendc); lastBlendc = d->blendc; }
@@ -921,7 +1216,8 @@ static void frame_end(void) {
             gsTargets[d->target].cleared = 1;
         }
         set_pipe(d->pipeline);
-        glBindVertexArray(d->vu ? sVaoVu : sVaoGs);
+        c_validate();
+        c_vao(d->vu ? sVaoVu : sVaoGs);
         if (d->vu) { set_uniform_u(&gsVuUni[d->uniform]); }
         memset(&fu, 0, sizeof(fu));
         memcpy(fu.mode, d->mode, sizeof(fu.mode));
@@ -933,7 +1229,7 @@ static void frame_end(void) {
             memcpy(&lastFu, &fu, sizeof(fu));
             haveFu = 1;
         }
-        set_textures((GLuint)d->tex, d->sampler, sDateCopy, 6, 0, 6);
+        set_textures(FEEDBACK_SAFE((GLuint)d->tex, d->target), d->sampler, sDateCopy, 6, 0, 6);
         if (d->blendc != lastBlendc) { glBlendColor(d->blendc, d->blendc, d->blendc, d->blendc); lastBlendc = d->blendc; }
         set_scissor(d->scissor);
         if (d->vu) {
@@ -943,6 +1239,10 @@ static void frame_end(void) {
         }
     }
 
+    if (UBO_RANGES) { ranges_done(); }
+#ifdef __EMSCRIPTEN__
+    Web_ProfAdd(1, emscripten_get_now() - tLoop); /* the draws themselves (Module.webStats.prof[1]) */
+#endif
     /* the shown buffer: the one sceGsSwapDBuff set up for this frame, else the first target */
     best = gGsMainFbp >= 0 ? GsDraw_TargetGet((uint32_t)gGsMainFbp, 0) : -1;
     for (i = 0; best < 0 && i < gsTargetCount; i++) { best = i; }
@@ -1016,6 +1316,12 @@ static void frame_end(void) {
     }
     Ui_DrawGL(); /* the overlay, over the presented picture */
     SDL_GL_SwapWindow(sWindow);
+#ifdef __EMSCRIPTEN__ /* the browser shows the canvas once the program gives way (port/web/include/web_yield.h) */
+    {
+        extern void Web_FrameDone(void);
+        Web_FrameDone();
+    }
+#endif
     if (getenv("BT3_GS_VERBOSE") != NULL) {
         GLenum e = glGetError();
         if (e != GL_NO_ERROR) { fprintf(stderr, "bt3: gl: frame error 0x%x\n", e); }

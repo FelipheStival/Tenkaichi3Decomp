@@ -36,3 +36,8 @@ port/build_release/
 /stages/
 /songs/
 /textures/
+/cloudflare/public/
+/cloudflare/.wrangler/
+/cloudflare/.dev.vars
+/demo/
+/cloudflare/wrangler.local.jsonc

@@ -52,6 +52,10 @@ match-making). F1, Video has a meter for the frame rate and, in a match, the pin
 Linux build has no rollback. [docs/netplay_notes.md](docs/netplay_notes.md) is the working log of how it is built
 and what was checked.
 
+- In the browser (experimental): the game in a web page on a computer or a phone, with touch controls,
+  controllers and online play with room codes and Quick Match; built from your own disc image. See
+  [docs/web/README.md](docs/web/README.md).
+
 See [docs/port/README.md](docs/port/README.md) for the running log of what is done, what is verified and what is not.
 
 ## Requirements
@@ -97,6 +101,7 @@ finished program fetches the values from your disc when it starts.
 | `port/release/` | The container and scripts that build the release archives |
 | `port/setup/` | The setup window |
 | `port/third_party/` | Dear ImGui (MIT), the maths library of newlib |
+| `port/web/`, `cloudflare/` | The browser build and its optional private deploy ([docs/web/README.md](docs/web/README.md)) |
 | `docs/` | Notes on the game (from the decompilation) and `docs/port/` on the port |
 
 This project was made with the help of AI.

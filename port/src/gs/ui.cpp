@@ -244,7 +244,12 @@ int Ui_Init(SDL_Window *window, SDL_GPUDevice *device, void *gl_context) {
     }
     if (device == NULL) { // the OpenGL back end (gs_gl.c), with its context current
         sGL = 1;
-        if (!ImGui_ImplSDL3_InitForOpenGL(window, (SDL_GLContext)gl_context) || !ImGui_ImplOpenGL3_Init("#version 330 core")) {
+#ifdef __EMSCRIPTEN__ // WebGL 2
+        const char *glsl = "#version 300 es";
+#else
+        const char *glsl = "#version 330 core";
+#endif
+        if (!ImGui_ImplSDL3_InitForOpenGL(window, (SDL_GLContext)gl_context) || !ImGui_ImplOpenGL3_Init(glsl)) {
             return 0;
         }
     } else {
@@ -287,6 +292,22 @@ extern "C" {
 extern volatile int gPortNetMenuRequest;
 extern volatile int gPortNetWindowClose; // gs/state.c
 }
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// The browser: Dragon Net Battle opens the page's screens (host, join with a room code; port/web/net.js) instead
+// of the window below. The game sits on its main menu meanwhile and takes no input (gWebInputHeld, gs_input.c)
+// until the page gives it back (Web_NetMenuClosed).
+extern "C" int gWebInputHeld;
+EM_JS(void, web_net_menu_js, (void), { if (Module.onNetMenu) Module.onNetMenu(); });
+static void web_net_menu(void) {
+    gWebInputHeld = 1;
+    web_net_menu_js();
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void Web_NetMenuClosed(void) {
+    gWebInputHeld = 0;
+}
+#endif
 
 static void net_open(void) {
     set_open(true);
@@ -933,7 +954,11 @@ static bool frame_build(void) {
         set_open(false);
     } else if (sReady && gPortNetMenuRequest) { // Dragon Net Battle was chosen in the game's main menu
         gPortNetMenuRequest = 0;
+#ifdef __EMSCRIPTEN__
+        web_net_menu(); // the browser: the page's own online screens (port/web/net.js), over the main menu
+#else
         net_open();
+#endif
     }
     bool notice = sNotice[0] != '\0' && SDL_GetTicks() < sNoticeUntil;
     if (sNoticeNew) { // (set from the game's side: the time starts when it is first drawn)
@@ -971,11 +996,23 @@ static bool frame_build(void) {
     if (meter) {
         meter_draw();
     }
+    // (where the picture is, from the GL back end in the drawable's pixels; ImGui draws in the window's points,
+    // which differ on a high-density screen: a phone's 3 pixels a point, a Retina Mac's 2)
+    float gPX, gPY, gPW, gPH;
+    {
+        ImGuiIO &fio = ImGui::GetIO();
+        float fx = fio.DisplayFramebufferScale.x > 0.0f ? fio.DisplayFramebufferScale.x : 1.0f;
+        float fy = fio.DisplayFramebufferScale.y > 0.0f ? fio.DisplayFramebufferScale.y : 1.0f;
+        gPX = (float)gUiPresentX / fx;
+        gPY = (float)gUiPresentY / fy;
+        gPW = (float)gUiPresentW / fx;
+        gPH = (float)gUiPresentH / fy;
+    }
     if (names && gUiPresentW > 0 && gUiPresentH > 0) {
         // Under each side's health bar (the game's 512 x 448 page: the bars end at about y 50). The left place is
         // side 0's, or this player's own side when the HUD's sides are swapped.
         ImDrawList *dl = ImGui::GetBackgroundDrawList();
-        float sx = (float)gUiPresentW / 512.0f, sy = (float)gUiPresentH / 448.0f;
+        float sx = gPW / 512.0f, sy = gPH / 448.0f;
         float size = 15.0f * sy;
         ImFont *font = ImGui::GetFont();
         for (int place = 0; place < 2; place++) {
@@ -984,8 +1021,8 @@ static bool frame_build(void) {
                 continue;
             }
             ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
-            float x = place == 0 ? (float)gUiPresentX + 62.0f * sx : (float)gUiPresentX + (512.0f - 62.0f) * sx - ts.x;
-            float y = (float)gUiPresentY + 56.0f * sy;
+            float x = place == 0 ? gPX + 62.0f * sx : gPX + (512.0f - 62.0f) * sx - ts.x;
+            float y = gPY + 56.0f * sy;
             for (int ox = -1; ox <= 1; ox++) {
                 for (int oy = -1; oy <= 1; oy++) {
                     if (ox != 0 || oy != 0) {
@@ -1009,8 +1046,8 @@ static bool frame_build(void) {
     if (overlay && gUiPresentW > 0 && gUiPresentH > 0) {
         /* Each name's rectangle is in the game's 512x448 pixels: map it through the picture's rectangle in the
            window (the letterbox gs_gpu.c just blitted into). */
-        float sx = (float)gUiPresentW / 512.0f;
-        float sy = (float)gUiPresentH / 448.0f;
+        float sx = gPW / 512.0f;
+        float sy = gPH / 448.0f;
         ImDrawList *dl = ImGui::GetForegroundDrawList();
 
         if (nameOn && gUiNameIdx >= (int)sNameCount) { // no pre-rendered name for this one
@@ -1022,14 +1059,14 @@ static bool frame_build(void) {
             const FontName *fn = font_name(NF_STAGE, PortStages_Name(gUiNameIdx));
             if (fn != NULL) {
                 float kx = (float)gUiNameW * sx / 384.0f, ky = (float)gUiNameH * sy / 48.0f;
-                font_draw(dl, fn, (float)gUiPresentX + (float)gUiNameX * sx - 64.0f * kx, (float)gUiPresentY + (float)gUiNameY * sy + (kNameDy - 14.0f) * ky, kx, ky, true);
+                font_draw(dl, fn, gPX + (float)gUiNameX * sx - 64.0f * kx, gPY + (float)gUiNameY * sy + (kNameDy - 14.0f) * ky, kx, ky, true);
             } else {
-                name_text(dl, PortStages_Name(gUiNameIdx), (float)gUiPresentX + (float)gUiNameX * sx, (float)gUiPresentY + (float)gUiNameY * sy,
+                name_text(dl, PortStages_Name(gUiNameIdx), gPX + (float)gUiNameX * sx, gPY + (float)gUiNameY * sy,
                           (float)gUiNameW * sx, (float)gUiNameH * sy, true);
             }
         } else if (nameOn) {
-            float x = (float)gUiPresentX + (float)gUiNameX * sx;
-            float y = (float)gUiPresentY + (float)gUiNameY * sy;
+            float x = gPX + (float)gUiNameX * sx;
+            float y = gPY + (float)gUiNameY * sy;
             float w = (float)gUiNameW * sx;
             float h = (float)gUiNameH * sy;
             dl->AddImage(ImTextureRef((ImTextureID)(intptr_t)sNameTex), ImVec2(x, y), ImVec2(x + w, y + h),
@@ -1042,14 +1079,14 @@ static bool frame_build(void) {
             if (fn != NULL) {
                 static const float kSongDx = -0.2f, kSongDy = 2.35f;
                 float kx = (float)gUiSongW * sx / 512.0f, ky = (float)gUiSongH * sy / 32.0f;
-                font_draw(dl, fn, (float)gUiPresentX + (float)gUiSongX * sx + kSongDx * kx, (float)gUiPresentY + (float)gUiSongY * sy + kSongDy * ky, kx, ky, false);
+                font_draw(dl, fn, gPX + (float)gUiSongX * sx + kSongDx * kx, gPY + (float)gUiSongY * sy + kSongDy * ky, kx, ky, false);
             } else {
-                name_text(dl, PortSongs_Name(gUiSongIdx), (float)gUiPresentX + (float)gUiSongX * sx, (float)gUiPresentY + (float)gUiSongY * sy,
+                name_text(dl, PortSongs_Name(gUiSongIdx), gPX + (float)gUiSongX * sx, gPY + (float)gUiSongY * sy,
                           (float)gUiSongW * sx, (float)gUiSongH * sy, false);
             }
         } else if (songOn) {
-            float x = (float)gUiPresentX + (float)gUiSongX * sx;
-            float y = (float)gUiPresentY + (float)gUiSongY * sy;
+            float x = gPX + (float)gUiSongX * sx;
+            float y = gPY + (float)gUiSongY * sy;
             float w = (float)gUiSongW * sx;
             float h = (float)gUiSongH * sy;
             dl->AddImage(ImTextureRef((ImTextureID)(intptr_t)sSongTex), ImVec2(x, y), ImVec2(x + w, y + h),

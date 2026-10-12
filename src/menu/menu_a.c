@@ -5,6 +5,8 @@ extern void Port_NetMenuOpen(void);
 extern int Port_NetMenuListed(void);
 extern int Port_NetSession(void);
 extern void Port_NetLeave(void);
+extern int Port_NetUiActive(void);   /* the browser's Dragon Net Battle screens are open over this menu (headless.c) */
+extern void *Port_NetUiText(s32 *line);
 #endif
 #include "sys/pad.h"
 #include "sys/save.h"
@@ -333,6 +335,44 @@ void MainMenu_Draw(void) {
         FlashAnim_Scroll(flash, &ref, &uv, &gMainMenu->cloud[i], NULL, i ? -0.18962963f : -0.35555556f, 0.0f);
     }
 
+#ifdef PORT
+    {   /* Dragon Net Battle in the browser (port/web/net.js): the screen keeps its background, guides and message
+           window, the dragon balls and the corners' clouds; its plates, arrows and title (words and badge) make way
+           for the online screens (drawn by the page in the same lettering, at the same resolution), and the
+           message window shows their text. Put back as it was when they close. */
+        static s32 hidden;
+        s32 on = Port_NetUiActive();
+        if (on || hidden) {
+            for (i = 0; i < 7; i++) {
+                sprintf(name, "mc_menu_plate_%d", i + 1);
+                Flash_FindLabel(flash, NULL, name, &ref);
+                Flash_ClipSetFlags(flash, &ref, 2, !on);
+            }
+            for (i = 0; i < 2; i++) {
+                Flash_FindLabel(flash, NULL, i ? "mc_menu_yajirusi_down" : "mc_menu_yajirusi_up", &ref);
+                Flash_ClipSetFlags(flash, &ref, 2, !on);
+            }
+            Flash_FindLabel(flash, NULL, "mc_title", &ref); /* (the words and their badge; the page draws its own) */
+            Flash_ClipSetFlags(flash, &ref, 2, !on);
+            if (!on) {
+                MsgWin_SetText(gMainMenu->msgText);
+            }
+            hidden = on;
+        }
+        for (i = 0; i < MAINMENU_FLASH_NUM; i++) {
+            Flash_Draw(&gMainMenu->flash[i]);
+        }
+        if (on) {
+            s32 line;
+            MsgWin_SetText(Port_NetUiText(&line));
+            MsgWin_Draw(0, 0, line);
+        } else {
+            IconWin_Draw();
+            MsgWin_Draw(0, 0, gMainMenu->voiceLine);
+        }
+        return;
+    }
+#endif
     for (i = 0; i < MAINMENU_FLASH_NUM; i++) {
         Flash_Draw(&gMainMenu->flash[i]);
     }

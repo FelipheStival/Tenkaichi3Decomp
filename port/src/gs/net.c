@@ -40,12 +40,54 @@ typedef int socklen_t;
 #define closesocket close
 #endif
 #include "gs_internal.h"
+#ifdef __EMSCRIPTEN__
+/* The browser: no sockets. The page's connection to the other player (port/web/net.js: a WebRTC data channel,
+   or the room's relay when the two cannot reach each other directly) carries the packets, one way and the other,
+   unreliable and unordered like UDP. The calls below keep their shape; the addresses mean nothing here (there is
+   one other player). The waits give the page its turn, so that what arrives is taken in meanwhile. */
+#include <emscripten.h>
+#include "web_yield.h"
+EM_JS(int, web_net_send, (const void *buf, int n), { return Module.netSend ? Module.netSend(HEAPU8.slice(buf, buf + n)) : n; });
+EM_JS(int, web_net_recv, (void *buf, int max), {
+    const p = Module.netRecv ? Module.netRecv() : null;
+    if (!p) return -1;
+    const n = Math.min(p.length, max);
+    HEAPU8.set(p.subarray(0, n), buf);
+    return n;
+});
+EM_JS(void, web_net_event, (const char *what, const char *text), {
+    if (Module.onNetEvent) Module.onNetEvent(UTF8ToString(what), text ? UTF8ToString(text) : '');
+});
+#undef closesocket
+#define socket(a, b, c) 1
+#define bind(s, a, l) 0
+#define fcntl(...) 0
+#define sendto(s, b, n, f, a, l) web_net_send((b), (int)(n))
+#define recvfrom(s, b, n, f, a, l) web_net_recv((b), (int)(n))
+#define closesocket(s) ((void)0)
+/* Waiting for the other player: wakes the moment one of their packets arrives (net.js calls Module.netWake), or
+   after `ms` (to send this side's input again). Not a plain sleep: a browser holds short timers to 4 ms, and a
+   game waiting 4 ms too long at every vertical blank, on both sides, falls behind real time on a phone. */
+EM_ASYNC_JS(void, web_net_wait, (double ms), {
+    await new Promise((resolve) => {
+        let t = 0;
+        const done = () => { clearTimeout(t); if (Module.netWake === done) Module.netWake = null; resolve(); };
+        Module.netWake = done;
+        if (Module.netHas && Module.netHas()) { done(); return; }
+        t = setTimeout(done, ms);
+    });
+});
+#define SDL_Delay(ms) web_net_wait((double)(ms))
+#define SDL_DelayNS(ns) web_net_wait(4.0) /* (the waits for input: until a packet comes, at most 4 ms) */
+#endif
 
 extern int Port_PadRead(int socket, unsigned char *data); /* gs_input.c: the keyboard and the controllers */
 void Port_NetLeave(void);
 
 enum { PAD = 18, RING = 4096, REDUNDANT = 16, MAGIC = 0x4E335442 /* "BT3N" */ };
-enum { T_HELLO = 1, T_HELLO_ACK = 2, T_INPUT = 3, T_BYE = 4, T_PING = 5, T_PONG = 6, T_CONFIG = 7, T_CONFIG_ACK = 8 };
+enum { T_HELLO = 1, T_HELLO_ACK = 2, T_INPUT = 3, T_BYE = 4, T_PING = 5, T_PONG = 6, T_CONFIG = 7, T_CONFIG_ACK = 8,
+       T_KEEP = 9 /* the browser page's "still here" (net.js), sent while its game waits for the disc */ };
+static uint64_t sLastHeardNs; /* when anything last came from the other side */
 /* The version of what goes over the line. The greeting and its answer carry it, and two copies that differ do not
    start a match (the input packets changed with version 2: times for the ping were added; a copy that read them
    the old way took them for input). 1 was releases 0.1.8 and 0.1.9, which said no version. */
@@ -121,6 +163,17 @@ static int auto_delay(int rttMs) {
     ticks = (rttMs * 1000 / 2 + 16682) / 16683 + 1; /* ceil(one way in blanks) + 1 */
     delay = ticks - 4;
     return delay < 1 ? 1 : delay > 6 ? 6 : delay;
+}
+
+/* The same without rollback: both games wait for each other every blank, so the delay has to cover the whole way
+   of the input (half the round trip, plus a blank for the next look at the line and one to spare). */
+static int lock_delay(int rttMs) {
+    int delay;
+    if (rttMs < 0) {
+        return 4;
+    }
+    delay = (rttMs * 1000 / 2 + 16682) / 16683 + 3; /* (+3: a home connection's jitter, mobile Wi-Fi's above all) */
+    return delay < 3 ? 3 : delay > 9 ? 9 : delay;
 }
 
 static int sMode = -1; /* 0 off, 1 host, 2 join */
@@ -217,6 +270,7 @@ static int receive(void) {
             continue;
         }
         got = 1;
+        sLastHeardNs = SDL_GetTicksNS();
         if (type == T_PING && n >= 12) { /* setting up: sent back as it came, for the round trip time */
             uint32_t pong[3] = {MAGIC, T_PONG, 0};
             memcpy(&pong[2], pkt + 8, 4);
@@ -438,6 +492,10 @@ static void net_start(int role, const char *host, const char *join) {
         if (sVersionBad) {
             fprintf(stderr, "bt3: net: the other player's game is another version; both need the same release\n");
             Port_UiNotice("The other player's game is a different version.");
+#ifdef __EMSCRIPTEN__
+            web_net_event("ended", "The other player's game is a different version.");
+            Port_NetLeave();
+#endif
             if (sSession) {
                 Port_NetLeave();
             }
@@ -446,6 +504,10 @@ static void net_start(int role, const char *host, const char *join) {
         SDL_Delay(2);
         if (now - t0 > 120000000000ull) {
             fprintf(stderr, "bt3: net: nobody answered in two minutes\n");
+#ifdef __EMSCRIPTEN__
+            web_net_event("ended", "The other player did not answer.");
+            Port_NetLeave();
+#endif
             exit(2);
         }
     }
@@ -467,7 +529,7 @@ static void net_start(int role, const char *host, const char *join) {
             SDL_Delay(1);
         }
         if (sAutoDelay) {
-            sDelay = auto_delay(sSetupRtt);
+            sDelay = sRollMax > 0 ? auto_delay(sSetupRtt) : lock_delay(sSetupRtt);
         }
         fprintf(stderr, "bt3: net: round trip %d ms%s\n", sSetupRtt, sAutoDelay ? " (the input delay is chosen from it)" : "");
         start = SDL_GetTicksNS();
@@ -504,6 +566,13 @@ static void net_start(int role, const char *host, const char *join) {
     }
     sHave[0] = sHave[1] = (uint32_t)sDelay + 1;
     fprintf(stderr, "bt3: net: connected; input delay %d blanks, %s\n", sDelay, sRollMax > 0 ? "rollback" : "waiting for each other");
+#ifdef __EMSCRIPTEN__
+    {
+        char info[64];
+        snprintf(info, sizeof(info), "%d %d", sDelay, sSetupRtt);
+        web_net_event("connected", info);
+    }
+#endif
     if (sRollMax > 0) {
         fprintf(stderr, "bt3: net: rollback of up to %d blanks\n", sRollMax);
     }
@@ -615,6 +684,9 @@ static void sample_local(unsigned tick) {
 static void ended(const char *why, unsigned tick) {
     fprintf(stderr, "bt3: net: %s (blank %u)\n", why, tick);
     Port_UiNotice(why);
+#ifdef __EMSCRIPTEN__
+    web_net_event("ended", why); /* (shown again after the page has loaded itself back) */
+#endif
     if (sSession) {
         Port_NetLeave(); /* back to the game as it normally is */
     }
@@ -667,7 +739,7 @@ static void roll_tick(unsigned tick) {
             if (sGone) {
                 ended("The other player left the match.", tick);
             }
-            if (now - t0 > QUIET_NS) {
+            if (now - t0 > QUIET_NS && now - sLastHeardNs > QUIET_NS) {
                 gone_quiet(tick);
             }
         }
@@ -747,7 +819,7 @@ void Port_NetBeginTick(unsigned tick) {
         if (sGone) {
             ended("The other player left the match.", tick);
         }
-        if (now - t0 > QUIET_NS) {
+        if (now - t0 > QUIET_NS && now - sLastHeardNs > QUIET_NS) {
             gone_quiet(tick);
         }
     }
@@ -819,6 +891,16 @@ int Port_NetView(void) {
 #endif
 
 static void relaunch(int role, const char *join, int port) {
+#ifdef __EMSCRIPTEN__
+    /* The browser: the page starts the session and leaves it (port/web/net.js) by loading itself again. Only the
+       way back from a session comes here; the lobby is the page's own. */
+    (void)role; (void)join; (void)port;
+    fflush(NULL);
+    web_net_event("leave", "");
+    for (;;) {
+        Web_SleepMs(1000); /* (until the page has gone) */
+    }
+#else
     char value[160];
 #ifdef _WIN32
     char exe[1024];
@@ -878,6 +960,7 @@ static void relaunch(int role, const char *join, int port) {
 #endif
     fprintf(stderr, "bt3: net: could not start the program again\n");
     exit(2);
+#endif
 }
 
 /* 1 in a session started from Dragon Net Battle. */
@@ -946,6 +1029,9 @@ int Port_NetWarp(void) {
 }
 void Port_NetArrived(void) {
     sArrived = 1;
+#ifdef __EMSCRIPTEN__
+    web_net_event("arrived", ""); /* the page takes its "preparing the match" screen away */
+#endif
 }
 
 /* The session is over (the game went back to the main menu, or the other side is gone): back to the game as it
@@ -1095,6 +1181,17 @@ int Port_NetStats(int *out) {
     out[7] = sAutoDelay;
     return 1;
 }
+
+#ifdef __EMSCRIPTEN__
+/* For the page's match log (net.js): Port_NetStats one value at a time (-1: no match). */
+EMSCRIPTEN_KEEPALIVE int Web_NetStat(int i) {
+    int out[8];
+    if (i < 0 || i > 7 || !Port_NetStats(out)) {
+        return -1;
+    }
+    return out[i];
+}
+#endif
 
 /* 1 while a copy of another release is trying to join the lobby this copy hosts. */
 int Port_LobbyOther(void) {

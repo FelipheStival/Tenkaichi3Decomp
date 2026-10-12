@@ -202,6 +202,53 @@ volatile int gPortNetMenuRequest;
 void Port_NetMenuOpen(void) {
     gPortNetMenuRequest = 1;
 }
+/* The browser's Dragon Net Battle screens (port/web/net.js) are drawn over the main menu, which keeps its own
+   background and message window for them (src/menu/menu_a.c). The window's text is a text file of the game's kind:
+   a count, the byte offsets of the lines, then the lines in 16-bit characters. Two lines, used in turn, so that each
+   new message is a new line to the window and types itself in as the game's own do. */
+static volatile int sNetUi;
+static uint32_t sNetUiFile[3 + 2 * 64 + 4]; /* count, two offsets, two lines of 128 characters */
+static int sNetUiLine;
+int Port_NetUiActive(void) {
+    return sNetUi;
+}
+void *Port_NetUiText(int *line) {
+    *line = sNetUiLine;
+    return sNetUiFile;
+}
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+EMSCRIPTEN_KEEPALIVE int Web_InLogos(void) { /* the boot pictures show (src/menu/menu_i_c.c): a tap skips them */
+    extern int gPortInLogos;
+    return gPortInLogos;
+}
+EMSCRIPTEN_KEEPALIVE int Web_GameMode(void) { /* (tests: which screen the game is on; 4 = the main menu) */
+    return gProgress != NULL ? gProgress->mode : -1;
+}
+static char sNetUiBuf[128];
+EMSCRIPTEN_KEEPALIVE char *Web_NetUiBuf(void) { /* where the page writes the next message (net.js) */
+    return sNetUiBuf;
+}
+EMSCRIPTEN_KEEPALIVE void Web_NetUiSet(int on, const char *msg) {
+    if (msg != NULL) {
+        int next = !sNetUiLine, i;
+        uint16_t *dst = (uint16_t *)((uint8_t *)sNetUiFile + sNetUiFile[1 + next]);
+        if (sNetUiFile[0] == 0) {
+            sNetUiFile[0] = 2;
+            sNetUiFile[1] = 12;
+            sNetUiFile[2] = 12 + 128 * 2;
+        }
+        dst = (uint16_t *)((uint8_t *)sNetUiFile + sNetUiFile[1 + next]);
+        for (i = 0; i < 127 && msg[i] != '\0'; i++) {
+            dst[i] = (uint8_t)msg[i];
+        }
+        dst[i] = 0;
+        sNetUiLine = next;
+    }
+    sNetUi = on;
+}
+#endif
+
 /* (asked here and not in the game's file: there a pointer is 4 bytes wide in the 64-bit build, and getenv's is not) */
 int Port_NetMenuListed(void) {
     const char *e = getenv("BT3_MENU_ITEM4");
@@ -215,8 +262,26 @@ int Port_NetMenuListed(void) {
    here, on the game's side, at a vertical blank. */
 
 
+#ifdef __EMSCRIPTEN__
+/* The browser page's online screens (port/web/net.js) play the menus' own sounds, as the main menu does
+   (src/menu/menu_a.c): 0 the cursor moved, 1 chosen, 2 back. Asked from the page between blanks, played at the
+   next one, on the game's side. */
+#include <emscripten.h>
+extern int Snd_PlaySe(unsigned mask, int id);
+static volatile int sWebSe = -1;
+EMSCRIPTEN_KEEPALIVE void Web_MenuSe(int id) {
+    sWebSe = id;
+}
+#endif
+
 void Port_Trace(unsigned vblanks) {
     static int every = -1;
+#ifdef __EMSCRIPTEN__
+    if (sWebSe >= 0) {
+        Snd_PlaySe(1, sWebSe);
+        sWebSe = -1;
+    }
+#endif
     float p[2][4] __attribute__((aligned(16)));
     unsigned u[2][3];
     int *clock;
@@ -250,6 +315,12 @@ void Port_Trace(unsigned vblanks) {
     if (Port_NetWarp() && sNetEntered && gProgress != NULL && !(gProgress->flags & 0x40)) {
         Port_NetArrived(); /* the logos and the card check are over: the character select is next, with picture and sound */
     }
+#ifdef __EMSCRIPTEN__
+    {   /* the browser build: everything unlocked from the start (port/web/src/web_unlock.c) */
+        extern void Web_AutoUnlock(void);
+        Web_AutoUnlock();
+    }
+#endif
     if (gPortUnlockAll) {
         gPortUnlockAll = 0;
         if (gSaveData != NULL) {

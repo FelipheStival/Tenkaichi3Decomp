@@ -636,6 +636,15 @@ s32 BtlMenu_Update(s32 which, BtlMenu *parent, BtlMenu *menu, s32 pad) {
         goto end;
     }
     press = gPad[pad].gamePressed;
+#ifdef PORT
+    {   /* An online match: the result menu (Fight Again, Character Select, ...) answers either player, not only the
+           winner. Both machines have both pads' input, so both make the same choice. */
+        extern int Port_NetSession(void);
+        if (which == 1 && pad >= 0 && pad <= 1 && Port_NetSession()) {
+            press |= gPad[!pad].gamePressed;
+        }
+    }
+#endif
     if (BtlMenu_IsSkillList(menu)) {
         gBtlMenu->skillList = 1;
     }

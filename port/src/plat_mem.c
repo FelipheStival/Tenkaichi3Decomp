@@ -168,6 +168,17 @@ int __wrap_main(int argc, char **argv) {
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef __EMSCRIPTEN__
+/* The browser build: WebAssembly memory starts at address 0 and the program's own data, stack and C heap begin
+   above the PS2 regions (port/web/link.py, GLOBAL_BASE), so the regions are already there and zeroed. */
+extern char __global_base[];
+static void map(uint32_t addr, uint32_t size, const char *what) {
+    if (addr + size > (uint32_t)(uintptr_t)__global_base) {
+        fprintf(stderr, "bt3: %s at 0x%08X is not below the program (0x%08X)\n", what, addr, (unsigned)(uintptr_t)__global_base);
+        exit(2);
+    }
+}
+#else
 static void map(uint32_t addr, uint32_t size, const char *what) {
     void *p = mmap((void *)(uintptr_t)addr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                    -1, 0);
@@ -177,6 +188,7 @@ static void map(uint32_t addr, uint32_t size, const char *what) {
         exit(2);
     }
 }
+#endif
 
 static void map_heap(void) {
     map(HEAP_BASE, HEAP_END - HEAP_BASE, "the game heap");
@@ -503,7 +515,9 @@ __attribute__((constructor)) static void Port_MapMemory(void) {
     map_heap();
     map(0x10000000u, 0x10000, "the hardware registers");
     map(0x12000000u, 0x2000, "the GS registers");
+#ifndef __EMSCRIPTEN__ /* (no game code uses it; the browser build's memory ends far below 0x70000000) */
     map(0x70000000u, 0x4000, "the scratchpad");
+#endif
     gPortStage = "memory ready, before the program's main";
 }
 

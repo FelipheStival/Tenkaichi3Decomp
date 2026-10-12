@@ -1128,10 +1128,17 @@ SDL_Window *GsDraw_WindowCreate(int opengl) {
         fprintf(stderr, "bt3: BT3_DISPLAY=%d: there are %d displays\n", pick, count);
     }
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, sFullscreen);
+#ifdef __EMSCRIPTEN__ /* the browser: the page sizes the canvas (CSS); draw at the screen's real pixels (phones: 2-3 per CSS pixel) */
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN, true);
+#endif
     sWindow = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     SDL_free(displays);
+#ifdef __EMSCRIPTEN__
+    if (0) {
+#else
     if (sWindow != NULL && !sFullscreen) {
+#endif
         SDL_SetWindowSize(sWindow, (int)((float)896 * want + 0.5f), 896);
     }
     fprintf(stderr, "bt3: internal resolution %dx (%d x %d)\n", gsScale, 512 * gsScale, 448 * gsScale);
@@ -1144,7 +1151,11 @@ void GsDraw_WindowShape(void) {
     float want = (float)Port_AspectMilli() / 1000.0f;
     int w, h;
     sWantAspect = want;
+#ifndef __EMSCRIPTEN__ /* (the browser: the page decides the canvas's size) */
     if (!sFullscreen && sWindow != NULL) {
+#else
+    if (0) {
+#endif
         SDL_GetWindowSize(sWindow, &w, &h);
         SDL_SetWindowSize(sWindow, (int)((float)h * want + 0.5f), h);
     }
@@ -3137,7 +3148,12 @@ void GsGpu_InterpPump(int ahead_ms, int all) {
                 return; /* not yet: at the next blank */
             }
             if (now < due) {
+#ifdef __EMSCRIPTEN__ /* the browser: wait without blocking the page (port/web/include/web_yield.h) */
+                extern void Web_SleepMs(double ms);
+                Web_SleepMs((double)(due - now) / 1e6);
+#else
                 SDL_DelayPrecise(due - now);
+#endif
             }
         }
         if (sInterpNext == sInterpSteps && getenv("BT3_INTERP_ONLY") != NULL) {

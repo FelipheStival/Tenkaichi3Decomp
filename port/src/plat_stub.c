@@ -113,6 +113,12 @@ static void vblank_wait(void) {
         while (now_ns() < next) {
             Sleep(0);
         }
+#elif defined(__EMSCRIPTEN__)
+        {   /* the browser: wait without blocking the page (port/web/include/web_yield.h) */
+            extern void Web_SleepMs(double ms);
+            (void)ts;
+            Web_SleepMs((double)(next - t) / 1e6);
+        }
 #else
         ts.tv_sec = 0;
         ts.tv_nsec = (long)(next - t);
@@ -150,6 +156,21 @@ static void vblank_wait(void) {
 #undef next
 static unsigned char sPadLast[2][18]; /* (defined with the pads below) */
 void Port_VBlank(void) {
+#ifdef __EMSCRIPTEN__
+    { /* browser build: how fast the game runs (every 300 vertical blanks: blanks per second of real time) */
+        extern double emscripten_get_now(void);
+        static unsigned n;
+        static double t0;
+        double now = emscripten_get_now();
+        if (n == 0) {
+            t0 = now;
+        } else if (n % 300 == 0) {
+            fprintf(stderr, "web: %u blanks, %.1f per second\n", n, 300.0 * 1000.0 / (now - t0));
+            t0 = now;
+        }
+        n++;
+    }
+#endif
     {
         extern void Port_SessionPoll(void); /* gs/state.c: the state at the first blank is kept; an online session
                                                begins or ends here */

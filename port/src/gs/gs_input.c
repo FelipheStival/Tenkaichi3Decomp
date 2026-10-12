@@ -20,6 +20,9 @@
 #include "ui.h"
 
 int gPortOverlayOpen, gPortInputCapture;
+#ifdef __EMSCRIPTEN__
+int gWebInputHeld; /* the browser page's online screens are open over the game (ui.cpp): the pads read idle */
+#endif
 extern int Port_Setting(const char *name, int def); /* plat_settings.c */
 extern void Port_SettingSave(const char *name, int value), Port_SettingsWrite(void);
 
@@ -348,6 +351,16 @@ int Port_PadRead(int socket, unsigned char *data) {
     if (socket == 0) {
         btn |= script_buttons();
     }
+#ifdef __EMSCRIPTEN__
+    if (socket == 0) { /* the browser page's touch controls (port/web/src/web_touch.c) */
+        extern unsigned Web_TouchRead(unsigned char *lx, unsigned char *ly);
+        btn |= Web_TouchRead(&lx, &ly);
+    }
+    if (gWebInputHeld) {
+        btn = 0;
+        lx = ly = rx = ry = 0x80;
+    }
+#endif
     clash_square(socket, &btn, &lx, &ly);
     memset(data, 0, 18);
     data[0] = (unsigned char)(~btn & 0xFF);       /* active low */
