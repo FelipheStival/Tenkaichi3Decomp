@@ -1,0 +1,30 @@
+# Uso (com a ISO do PS2, USA SLUS-21678, salva como jogo.iso na raiz do projeto):
+#   docker compose up        # compila o que faltar e sobe o servidor; o link com a chave aparece no log
+#   docker compose down      # desliga
+#
+# A primeira vez demora (extrai a ISO e compila tudo); depois só refaz o que mudou.
+
+x-common: &common
+  build:
+    context: docker
+  image: bt3-web
+  pull_policy: build   # refaz a imagem quando docker/Dockerfile muda (usa cache: rápido)
+  # Se a imagem do emsdk não tiver arm64 na versão escolhida, descomente:
+  # platform: linux/amd64
+  volumes:
+    - .:/src
+
+services:
+  build:
+    <<: *common
+    command: bash docker/build-web.sh
+
+  serve:
+    <<: *common
+    command: bash docker/serve.sh
+    depends_on:
+      build:
+        condition: service_completed_successfully
+    ports:
+      - "4500:4500"
+    restart: unless-stopped

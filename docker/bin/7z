@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Imagens regravadas (ex.: ImgBurn) têm UDF e ISO9660; o 7z prefere o UDF, onde os nomes podem estar
+# em minúsculas (slus_216.78). Força a leitura ISO9660, com os nomes que install.py procura.
+exec /usr/bin/7z "$1" -tiso "${@:2}"

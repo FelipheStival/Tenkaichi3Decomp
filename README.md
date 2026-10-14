@@ -54,7 +54,7 @@ and what was checked.
 
 - In the browser (experimental): the game in a web page on a computer or a phone, with touch controls,
   controllers and online play with room codes and Quick Match; built from your own disc image. See
-  [docs/web/README.md](docs/web/README.md).
+  [docs/web/README.md](docs/web/README.md), or [run it with Docker](#rodando-no-navegador-com-docker).
 
 See [docs/port/README.md](docs/port/README.md) for the running log of what is done, what is verified and what is not.
 
@@ -89,6 +89,88 @@ The release archives for Linux and Windows are built from the repository alone, 
 `port/release/build.sh` (needs only docker) or the GitHub workflow in `.github/workflows/release.yml`. The
 repository carries the shape of the game's built-in data tables without their values (`port/data`); the
 finished program fetches the values from your disc when it starts.
+
+## Rodando no navegador com Docker
+
+A versão web (WebAssembly) compilada e servida por um único comando, em qualquer sistema com Docker
+(macOS, inclusive Apple Silicon, Linux ou Windows). Não precisa instalar Emscripten, Python nem Node na máquina.
+
+### 1. Requisitos
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (ou Docker Engine + Compose)
+- A **sua** imagem do jogo de **PS2, versão USA (SLUS-21678)**, sem modificações. Outras regiões, a versão de Wii
+  e ISOs modificadas não funcionam (o build confere o checksum)
+- Cerca de **10 GB livres** em disco (a ISO e os dados extraídos dela)
+
+### 2. Colocar a ISO
+
+Copie a ISO para a raiz do projeto com o nome **`jogo.iso`**. O `.gitignore` já ignora `*.iso` e tudo o que é extraído dela.
+
+### 3. Rodar
+
+```bash
+docker compose up        # compila o que faltar e sobe o servidor
+docker compose up -d     # o mesmo, em segundo plano (o link aparece em: docker compose logs serve)
+docker compose down      # desliga
+```
+
+A primeira vez demora bastante: o build extrai a ISO e compila o jogo inteiro. Nas próximas, só refaz o que
+mudou e o servidor sobe em segundos. Quando estiver pronto, o log mostra:
+
+```
+==================================================================
+  Você (Chrome):   http://localhost:4500/?k=<chave>
+  Seu amigo (mesma rede / Hamachi / Tailscale):
+                   http://<seu IP na rede ou no Hamachi>:4500/?k=<chave>
+==================================================================
+```
+
+Abra o link no **Chrome** ou no Edge (versão JSPI, a mais rápida). O Safari também funciona (versão Asyncify).
+A chave fica em `port/build/lan.key` e não muda entre execuções. Sem ela, o servidor responde 403. Depois do
+primeiro acesso, o navegador guarda um cookie.
+
+### Jogar online na mesma rede (Wi-Fi, Hamachi, Tailscale, ZeroTier)
+
+O servidor do Docker (`docker/server.mjs`) já inclui as salas online que, no deploy oficial, ficam no Cloudflare:
+
+1. Seu amigo abre `http://<seu IP>:4500/?k=<chave>`. Use o IP da rede local, ou o da VPN (no Hamachi, ele começa com `25.`).
+2. Os dois entram em **Dragon Net Battle** no menu principal. Um clica em **Host** e passa o código de 4 letras para o
+   outro, que clica em **Join**. Ou os dois usam **Quick Match**.
+3. O jogo liga os dois navegadores direto (WebRTC). Se não conseguir, os pacotes passam pelo servidor.
+
+Se o macOS perguntar, permita conexões de entrada para o Docker. No PC do amigo, o jogo abre por `http://` com um
+IP, e o Chrome pode bloquear controles nesse caso (teclado e toque funcionam). Para liberar, ele pode adicionar
+`http://<seu IP>:4500` em `chrome://flags/#unsafely-treat-insecure-origin-as-secure` e reiniciar o Chrome.
+
+Quem abre o link joga com o jogo da sua ISO: compartilhe só com quem também tem o jogo original.
+
+### Resolução e tela
+
+- **F1**, aba **Video**: resolução interna (1x a 8x; o padrão é 2x, ~1280×896; 3x dá ~1920×1344) e formato da tela
+  (4:3, 16:9, 21:9...). A escolha fica salva no navegador.
+- Também dá para forçar pela URL: `&env=BT3_SCALE=3,BT3_ASPECT=16:9`
+- Outras opções da URL: `&hud=1` mostra o FPS, e `&movie=1` ativa o vídeo de abertura.
+
+### Arquivos
+
+| Arquivo | O que faz |
+|---|---|
+| `docker-compose.yml` | Serviço `build` (compila) e `serve` (sobe só depois de o build terminar com sucesso) |
+| `docker/Dockerfile` | Imagem `emscripten/emsdk` + 7z, Pillow (ícones) e `ws` (salas online) |
+| `docker/build-web.sh` | Etapas de disco do `install.py` (checagem da ISO, extração, split), `build.py`, `gen_data_web.py` e link das duas versões. Pula o que já está pronto |
+| `docker/bin/7z` | Faz o 7z ler a parte ISO9660 da imagem. ISOs regravadas (ImgBurn) também têm UDF, com nomes em minúsculas que o build não encontra |
+| `docker/serve.sh` | Cria a chave e mostra os links |
+| `docker/server.mjs` | Servidor local: página, disco por range requests, chave de acesso e as salas online (adaptadas de `cloudflare/src/room.js`) |
+
+### Problemas comuns
+
+- **`no SLUS_216.78 on it`**: a ISO não é a versão USA de PS2, ou não está na raiz com o nome `jogo.iso`.
+- **`no space left on device`**: libere espaço e rode `docker system prune -f`. Depois, rode `docker compose up` de
+  novo: o build continua de onde parou.
+- **Imagem sem arm64**: descomente `platform: linux/amd64` no `docker-compose.yml` (fica mais lento por emulação).
+- **Erro de compilação com uma versão nova do Emscripten**: o projeto foi feito com a 6.0. Fixe a versão com o
+  build arg `EMSDK_VERSION` no `docker/Dockerfile`.
+- **Detalhes de um erro**: veja o `install.log` (etapas da ISO) e a saída de `docker compose logs build`.
 
 ## Layout
 
